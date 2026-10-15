@@ -1,0 +1,102 @@
+# Fetch the `dynamic-tcp` repository from a network that can reach gitlab.abo.fi
+#
+# WHY THIS EXISTS
+#   gitlab.abo.fi must be reached, but it is unreachable from the machine where the
+#   replication is being prepared (DNS resolves to 130.232.212.166, but TCP 443/80/22
+#   are all closed/filtered; third-party fetch proxies also time out).
+#   GitHub-hosted runners have a different network path, so this workflow attempts the
+#   clone from inside GitHub's infrastructure and lets you download the result.
+#
+# HOW TO USE
+#   1. Create a (public or private) GitHub repository - an empty one is fine.
+#   2. Put this file at  .github/workflows/fetch-dynamic-tcp.yml
+#   3. Commit and push.
+#   4. Open the repository's "Actions" tab -> "fetch dynamic-tcp" -> wait for the run.
+#   5. Download the artifact "dynamic-tcp-bundle" (contains a .bundle git file and a
+#      .tar.gz of the worktree).
+#
+#   No secrets or tokens are required: uploading a workflow artifact needs no credentials.
+#   The upstream project is MIT-licensed, so mirroring it is permitted (keep the LICENSE).
+#
+# IF THE UPSTREAM IS STILL DOWN (HTTP 502 / timeout):
+#   Rerun later, or use one of the alternative routes listed in RETRIEVAL_NOTES.md.
+
+name: fetch dynamic-tcp
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # Try several endpoints: the host may be globally down (all fail),
+        # or only some paths may work.
+        target:
+          - https://gitlab.abo.fi/stc/dynamic-tcp.git
+          - https://gitlab.abo.fi/stc/dynamic-tcp
+    steps:
+      - name: Diagnostics - can this runner resolve and reach the host?
+        run: |
+          set -x
+          getent hosts gitlab.abo.fi || echo "DNS: no result"
+          curl -sS -o /dev/null -w "https status=%{http_code} time=%{time_total}s\n" \
+            --max-time 30 https://gitlab.abo.fi/ || echo "curl to host failed (expected if down)"
+
+      - name: Clone with full history (and mirror clone as fallback)
+        run: |
+          set -x
+          TARGET="${{ matrix.target }}"
+          ok=0
+          # 1) ordinary clone with full history so old blob versions are preserved
+          git clone --no-single-branch "$TARGET" repo && ok=1 || echo "clone failed: $TARGET"
+          if [ "$ok" = "0" ]; then
+            # 2) mirror clone as a second attempt
+            git clone --mirror "$TARGET" repo.git && ok=2 || echo "mirror clone failed: $TARGET"
+          fi
+          echo "OK_LEVEL=$ok" >> "$GITHUB_ENV"
+          ls -la || true
+
+      - name: Package results
+        if: env.OK_LEVEL != '0'
+        run: |
+          set -x
+          mkdir -p out
+          if [ "$OK_LEVEL" = "1" ]; then
+            cd repo
+            git log --oneline --all | head -50 > ../out/git-log.txt
+            git log -1 --format='%H %ci %an %s' > ../out/head-commit.txt
+            git bundle create ../out/dynamic-tcp.bundle --all
+            cd ..
+            tar czf out/dynamic-tcp-worktree.tar.gz repo
+            # also list every file so the structure is auditable even without the code
+            find repo -type f -not -path '*/.git/*' | sort > out/file-list.txt
+          else
+            cd repo.git
+            git bundle create ../out/dynamic-tcp.bundle --all
+            cd ..
+            git clone --bare repo.git out/repo-bare || true
+            tar czf out/dynamic-tcp-worktree.tar.gz repo.git
+            git --git-dir=repo.git log --oneline --all | head -50 > out/git-log.txt
+          fi
+          ls -la out/
+
+      - name: Upload artifact
+        if: env.OK_LEVEL != '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dynamic-tcp-bundle-${{ strategy.job-index }}
+          path: out/
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Note when the host was unreachable
+        if: env.OK_LEVEL == '0'
+        run: |
+          echo "::warning::gitlab.abo.fi was NOT reachable from the GitHub runner either. The host appears to be down globally - retry later."
+          
